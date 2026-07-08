@@ -6,5 +6,6 @@
   "appToken": "base_id / app_token của Lark Base",
   "tableChannel": "tblXXXX (bảng nhận dữ liệu KÊNH)",
   "tableVideo": "tblYYYY (bảng nhận dữ liệu VIDEO)",
-  "channel": "@handle hoặc UCxxxxxxxx (kênh YouTube nguồn)"
+  "channel": "@handle hoặc UCxxxxxxxx (kênh YouTube nguồn)",
+  "larkNotifyWebhook": "(TUỲ CHỌN) URL webhook Custom Bot trong nhóm Lark để nhận card báo cáo cuối job. Để trống nếu không dùng."
 }

@@ -20,12 +20,13 @@ const YT = "https://www.googleapis.com/youtube/v3";
 
 // ---------- args ----------
 function parseArgs(argv) {
-  const a = { only: "all", limit: 0, refreshThumbs: false, config: path.join(__dirname, "config.local.json") };
+  const a = { only: "all", limit: 0, refreshThumbs: false, skipPreflight: false, config: path.join(__dirname, "config.local.json") };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
     if (k === "--only") a.only = argv[++i];
     else if (k === "--limit") a.limit = parseInt(argv[++i], 10) || 0;
     else if (k === "--refresh-thumbs") a.refreshThumbs = true;
+    else if (k === "--skip-preflight") a.skipPreflight = true;
     else if (k === "--config") a.config = argv[++i];
     else if (k === "--help") { console.log("Xem đầu file để biết cờ."); process.exit(0); }
   }
@@ -45,6 +46,7 @@ CFG.appToken      = E.LARK_BASE_ID    || CFG.appToken;
 CFG.tableChannel  = E.TABLE_CHANNEL   || CFG.tableChannel;
 CFG.tableVideo    = E.TABLE_VIDEO     || CFG.tableVideo;
 CFG.channel       = E.YT_CHANNEL      || CFG.channel;
+CFG.larkNotifyWebhook = E.LARK_NOTIFY_WEBHOOK || CFG.larkNotifyWebhook; // TUỲ CHỌN: webhook bot Lark để gửi card báo cáo cuối job
 for (const k of ["youtubeApiKey", "larkAppId", "larkAppSecret", "appToken", "tableChannel", "tableVideo", "channel"]) {
   if (!CFG[k]) { console.error(`Thiếu cấu hình "${k}" (điền config.local.json hoặc set biến môi trường tương ứng).`); process.exit(1); }
 }
@@ -98,11 +100,8 @@ async function larkApi(method, apiPath, body) {
   throw new Error(`Lark ${apiPath}: hết lượt thử.`);
 }
 
-/** Tải ảnh từ URL rồi upload lên Lark drive (bitable_image) -> file_token */
-async function uploadThumb(imgUrl, fileName) {
-  const ir = await fetch(imgUrl);
-  if (!ir.ok) throw new Error(`Tải thumbnail lỗi ${ir.status}`);
-  const buf = Buffer.from(await ir.arrayBuffer());
+/** Upload 1 buffer ảnh lên Lark drive (bitable_image) -> file_token */
+async function uploadMedia(buf, fileName) {
   const token = await larkToken();
   const form = new FormData();
   form.append("file_name", fileName);
@@ -118,6 +117,14 @@ async function uploadThumb(imgUrl, fileName) {
   const j = await r.json();
   if (j.code !== 0) throw new Error(`Upload media lỗi: ${j.code} ${j.msg}`);
   return j.data.file_token;
+}
+
+/** Tải ảnh từ URL rồi upload lên Lark drive -> file_token */
+async function uploadThumb(imgUrl, fileName) {
+  const ir = await fetch(imgUrl);
+  if (!ir.ok) throw new Error(`Tải thumbnail lỗi ${ir.status}`);
+  const buf = Buffer.from(await ir.arrayBuffer());
+  return uploadMedia(buf, fileName);
 }
 
 async function listAllRecords(tableId) {
@@ -137,6 +144,43 @@ const createRecord = (tableId, fields) =>
   larkApi("POST", `/open-apis/bitable/v1/apps/${CFG.appToken}/tables/${tableId}/records`, { fields });
 const updateRecord = (tableId, recordId, fields) =>
   larkApi("PUT", `/open-apis/bitable/v1/apps/${CFG.appToken}/tables/${tableId}/records/${recordId}`, { fields });
+const deleteRecord = (tableId, recordId) =>
+  larkApi("DELETE", `/open-apis/bitable/v1/apps/${CFG.appToken}/tables/${tableId}/records/${recordId}`);
+
+// ---------- PRE-FLIGHT (fail-fast quyền ghi trước khi kéo dữ liệu) ----------
+// PNG 1x1 trong suốt để thử quyền upload media mà không cần tải ảnh ngoài.
+const PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64"
+);
+async function preflight() {
+  log("\n== PRE-FLIGHT (kiểm tra quyền trước khi đồng bộ) ==");
+  // 1) Quyền GHI Base — bắt lỗi 91403 sớm bằng cách tạo 1 record trống rồi xoá.
+  let recId;
+  try {
+    const d = await createRecord(CFG.tableChannel, {});
+    recId = d.record?.record_id;
+    log("  ✓ Ghi Base OK");
+  } catch (e) {
+    throw new Error(
+      `PRE-FLIGHT: GHI Base thất bại — ${e.message}\n` +
+      `  → App (bot) chưa có quyền SỬA Base. Mở Base → Chia sẻ / Add collaborators → thêm app → chọn "Có thể chỉnh sửa". (lỗi 91403)`
+    );
+  }
+  try { if (recId) await deleteRecord(CFG.tableChannel, recId); }
+  catch { log("  ! không xoá được record thử — hãy xoá tay 1 dòng trống trong bảng kênh."); }
+  // 2) Quyền UPLOAD ảnh — bắt lỗi 1061004 / thiếu scope drive:drive sớm.
+  try {
+    await uploadMedia(PIXEL_PNG, "_preflight.png");
+    log("  ✓ Upload ảnh OK");
+  } catch (e) {
+    throw new Error(
+      `PRE-FLIGHT: UPLOAD ảnh thất bại — ${e.message}\n` +
+      `  → Thiếu scope drive:drive hoặc app không có quyền sửa Base. Thêm scope, phát hành lại app. (lỗi 1061004)`
+    );
+  }
+  log("  → PRE-FLIGHT PASS. Bắt đầu đồng bộ.");
+}
 
 // ---------- YouTube ----------
 async function getChannel(handleOrId) {
@@ -194,16 +238,18 @@ async function syncChannel(ch) {
     "channel create time": Date.parse(ch.snippet.publishedAt),
   };
 
+  let thumbError = false;
   const needThumb = args.refreshThumbs || !found || !(found.fields["thumbnails"]?.length);
   if (needThumb) {
     try {
       const ft = await uploadThumb(bestThumb(ch.snippet.thumbnails), `${ch.id}.jpg`);
       fields["thumbnails"] = [{ file_token: ft }];
-    } catch (e) { log("  ! thumbnail kênh lỗi:", e.message); }
+    } catch (e) { log("  ! thumbnail kênh lỗi:", e.message); thumbError = true; }
   }
 
   if (found) { await updateRecord(CFG.tableChannel, found.record_id, fields); log(`  cập nhật kênh: ${ch.snippet.title}`); }
   else { await createRecord(CFG.tableChannel, fields); log(`  tạo mới kênh: ${ch.snippet.title}`); }
+  return { action: found ? "cập nhật" : "tạo mới", thumbErrors: thumbError ? 1 : 0 };
 }
 
 // ---------- SYNC VIDEO ----------
@@ -224,7 +270,7 @@ async function syncVideos(ch) {
   log(`  Lark hiện có: ${existing.length} record`);
 
   const channelLink = { link: `https://www.youtube.com/${ch.snippet.customUrl || "channel/" + ch.id}`, text: ch.snippet.title };
-  let created = 0, updated = 0, i = 0;
+  let created = 0, updated = 0, thumbErrors = 0, writeErrors = 0, i = 0;
   for (const v of details) {
     i++;
     const cur = byVid.get(v.id);
@@ -247,26 +293,91 @@ async function syncVideos(ch) {
       try {
         const ft = await uploadThumb(bestThumb(v.snippet.thumbnails), `${v.id}.jpg`);
         fields["thumbnails"] = [{ file_token: ft }];
-      } catch (e) { log(`  ! thumb ${v.id} lỗi: ${e.message}`); }
+      } catch (e) { log(`  ! thumb ${v.id} lỗi: ${e.message}`); thumbErrors++; }
     }
 
     try {
       if (cur) { await updateRecord(CFG.tableVideo, cur.record_id, fields); updated++; }
       else { await createRecord(CFG.tableVideo, fields); created++; }
-    } catch (e) { log(`  ! ghi ${v.id} lỗi: ${e.message}`); }
+    } catch (e) { log(`  ! ghi ${v.id} lỗi: ${e.message}`); writeErrors++; }
 
     if (i % 25 === 0) log(`  ... ${i}/${details.length} (tạo ${created}, cập nhật ${updated})`);
   }
-  log(`  XONG video: tạo ${created}, cập nhật ${updated}`);
+  log(`  XONG video: tạo ${created}, cập nhật ${updated}, lỗi thumb ${thumbErrors}, lỗi ghi ${writeErrors}`);
+  return { created, updated, thumbErrors, writeErrors };
+}
+
+// ---------- BÁO CÁO (đóng vòng monitor) ----------
+async function sendReport(s) {
+  if (!CFG.larkNotifyWebhook) return; // không cấu hình webhook -> bỏ qua im lặng
+  const ok = s.status === "OK";
+  const lines = [
+    `**Kênh:** ${s.channel}`,
+    `**Subs:** ${s.subs} · **Video (YouTube):** ${s.videos}`,
+    `**Chế độ:** only=${s.only}${s.limit ? " · limit=" + s.limit : ""}`,
+    "---",
+    s.channelAction ? `**Kênh:** ${s.channelAction}` : null,
+    s.videoCreated != null ? `**Video:** tạo ${s.videoCreated} · cập nhật ${s.videoUpdated}` : null,
+    `**Lỗi:** thumbnail ${s.thumbErrors} · ghi ${s.writeErrors}`,
+    `**Thời gian:** ${s.durationSec}s`,
+    s.errorMsg ? `---\n**Chi tiết lỗi:** ${s.errorMsg}` : null,
+  ].filter(Boolean);
+  const card = {
+    msg_type: "interactive",
+    card: {
+      config: { wide_screen_mode: true },
+      header: {
+        template: ok ? "green" : "red",
+        title: { tag: "plain_text", content: ok ? "✔ Sync YouTube → Lark hoàn tất" : "✖ Sync YouTube → Lark LỖI" },
+      },
+      elements: [{ tag: "div", text: { tag: "lark_md", content: lines.join("\n") } }],
+    },
+  };
+  try {
+    const r = await fetch(CFG.larkNotifyWebhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(card),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (j.code === 0 || j.StatusCode === 0 || j.StatusMessage === "success") log("  ✓ Đã gửi card báo cáo Lark");
+    else log(`  ! gửi card báo cáo lỗi: ${JSON.stringify(j)}`);
+  } catch (e) { log(`  ! gửi card báo cáo lỗi: ${e.message}`); }
 }
 
 // ---------- MAIN ----------
 async function main() {
+  const t0 = Date.now();
   log(`Kênh nguồn: ${CFG.channel} | only=${args.only}${args.limit ? " limit=" + args.limit : ""}${args.refreshThumbs ? " refresh-thumbs" : ""}`);
+  if (!args.skipPreflight) await preflight();
   const ch = await getChannel(CFG.channel);
   log(`Đã lấy kênh: ${ch.snippet.title} (${ch.id}) — subs ${ch.statistics.subscriberCount}, videos ${ch.statistics.videoCount}`);
-  if (args.only === "all" || args.only === "channel") await syncChannel(ch);
-  if (args.only === "all" || args.only === "video") await syncVideos(ch);
+
+  const summary = {
+    channel: ch.snippet.title, subs: ch.statistics.subscriberCount, videos: ch.statistics.videoCount,
+    only: args.only, limit: args.limit, thumbErrors: 0, writeErrors: 0, status: "OK",
+  };
+  if (args.only === "all" || args.only === "channel") {
+    const r = await syncChannel(ch);
+    summary.channelAction = r.action;
+    summary.thumbErrors += r.thumbErrors;
+  }
+  if (args.only === "all" || args.only === "video") {
+    const r = await syncVideos(ch);
+    summary.videoCreated = r.created; summary.videoUpdated = r.updated;
+    summary.thumbErrors += r.thumbErrors; summary.writeErrors += r.writeErrors;
+  }
+  summary.durationSec = Math.round((Date.now() - t0) / 1000);
   log("\n✔ Hoàn tất.");
+  await sendReport(summary);
 }
-main().catch((e) => { console.error("LỖI:", e.message); process.exit(1); });
+main().catch(async (e) => {
+  console.error("LỖI:", e.message);
+  try {
+    await sendReport({
+      channel: CFG.channel, subs: "?", videos: "?", only: args.only, limit: args.limit,
+      thumbErrors: 0, writeErrors: 0, durationSec: 0, status: "FAIL", errorMsg: e.message,
+    });
+  } catch { /* báo cáo lỗi không được thì thôi */ }
+  process.exit(1);
+});

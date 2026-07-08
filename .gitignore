@@ -1,5 +1,14 @@
-config.local.json
+# --- BẢO MẬT: không bao giờ commit file chứa token/secret ---
+**/config.local.json
+**/*_app.json
+.env
+*.env
+
+# --- rác build / tạm ---
 output/
 node_modules/
-.env
+__pycache__/
+*.pyc
 *.log
+.DS_Store
+Thumbs.db

@@ -46,17 +46,26 @@ Gọi **YouTube Data API v3 thật** để lấy dữ liệu một kênh + toàn
 ### Bước 1 — Cấu hình
 Copy `scripts/config.example.json` → `scripts/config.local.json`, điền: `youtubeApiKey`, `larkAppId`,
 `larkAppSecret`, `larkDomain`, `appToken` (base_id), `tableChannel`, `tableVideo`, `channel` (`@handle` hoặc `UCxxxx`).
+Tuỳ chọn: `larkNotifyWebhook` — URL Custom Bot của một nhóm Lark để nhận **card báo cáo cuối job**.
 > `config.local.json` chứa secret — không commit công khai.
 
 ### Bước 2 — Chạy đồng bộ
 ```bash
 node ".claude/skills/hmh-AIOS-sync-youtube-lark/scripts/sync-youtube-lark.mjs"
 ```
+Trước khi kéo dữ liệu, script chạy **PRE-FLIGHT**: tạo thử 1 record trống rồi xoá (kiểm tra quyền GHI Base — bắt lỗi
+`91403` sớm) và upload 1 ảnh 1×1 (kiểm tra scope `drive:drive` — bắt lỗi `1061004` sớm). Nếu fail → **dừng ngay
+với hướng dẫn sửa**, không kéo nửa chừng.
+
 Cờ tuỳ chọn:
 - `--only channel` | `--only video` | `--only all` (mặc định `all`).
 - `--limit N` — chỉ xử lý N video mới nhất (test nhanh trước khi kéo full).
 - `--refresh-thumbs` — tải & upload lại thumbnail cả với record đã có ảnh (mặc định BỎ QUA record đã có ảnh để chạy lại nhanh & tiết kiệm).
+- `--skip-preflight` — bỏ qua bước kiểm tra quyền (dùng khi đã chắc chắn quyền OK, tiết kiệm 1 vòng ghi thử).
 - `--config <path>` — dùng file config khác.
+
+Cuối job, nếu có `larkNotifyWebhook`, script gửi **card báo cáo** vào nhóm Lark: kênh, tạo/cập nhật video, số lỗi
+thumbnail/ghi, thời gian chạy (xanh = OK, đỏ = lỗi). Không cấu hình webhook thì bỏ qua im lặng.
 
 Gợi ý: chạy `--only channel` trước (nhẹ, kiểm tra quyền ghi + upload ảnh), rồi `--limit 20` để thử video,
 cuối cùng bỏ cờ để full sync.
